@@ -1,0 +1,27 @@
+{
+  "_설명": "게임 전체 설정. 금액은 만원. quick_laps는 발표용 빠른 모드 바퀴 수",
+  "_출처": "게임 규칙 문서 › 게임 개요, 인생 단계",
+  "settings": {
+    "start_money": 100,
+    "start_happiness": 0,
+    "laps_per_stage": [
+      1,
+      1,
+      2,
+      2,
+      1
+    ],
+    "quick_laps": [
+      1,
+      1,
+      1,
+      1,
+      1
+    ],
+    "invest_every": 5,
+    "invest_wait": 5,
+    "trend_rounds": 4,
+    "switch_cost": 1000,
+    "rest_happiness": 50
+  }
+}

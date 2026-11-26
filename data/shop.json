@@ -1,0 +1,19 @@
+{
+  "_설명": "상점 상품. price·amount는 크기 단어 → 그 단계 수치. student_only는 의대생에게만 보임. TODO(팀원): 나머지 상품 추가",
+  "_출처": "게임 규칙 문서 › 상점",
+  "shop": [
+    {
+      "id": "academy",
+      "name": "학원",
+      "price": "적당히",
+      "stat": "지력",
+      "amount": "적당히"
+    },
+    {
+      "id": "insurance",
+      "name": "보험",
+      "price": "조금",
+      "description": "다음 불행 1번 피해 50% 감소"
+    }
+  ]
+}

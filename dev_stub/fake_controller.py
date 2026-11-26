@@ -1,160 +1,294 @@
 """
-dev_stub/fake_controller.py  —  ⚠ 임시 코드 (팀원 Controller가 오기 전 테스트용)
+dev_stub/fake_controller.py  —  가짜 Controller (팀장 데모·테스트용)
 
-목적 두 가지
-  1) 내 View·Input·NPC를 실제 게임 흐름 순서대로 돌려 보기
-  2) 팀원에게 "Controller에서 내 모듈을 이렇게 부르면 된다"는 사용 예시 보여 주기
+규칙 문서 '한 턴의 순서' 8단계를 그대로 따라 View·Input·NPC를 부른다.
+팀원이 controller/game_controller.py를 만들 때 "내 모듈을 어떻게 부르는지" 보는 예시이기도 하다.
 
-흐름 (계획서 3.4 핵심 프로세스)
-  begin_turn → (사람: 버튼 클릭 대기 / NPC: 잠깐 기다렸다 자동) → roll
-  → show_dice → move_piece(애니메이션) → after_move(이동 반영·월급·단계 상승·칸 이벤트)
-  → end_turn → 다음 플레이어 begin_turn … 모두 노년기를 마치면 결과 화면
+  1 휴식 확인 → 2 주사위 → 3 국가고시(의대생) → 4 이동(출발 칸: 단계·직업·고유 장치)
+  → 5 칸 효과 → 6 매 턴 수입 → 7 투자 → 8 다음 사람
+
+지키는 약속
+  - 사람/NPC 구분은 decider() 한 곳에서만 한다. (Input과 NPC는 ask_* 함수 모양이 같다)
+  - 기다림은 QTimer로만 한다 (time.sleep 금지). 창(ask_*, show_*)은 모달이라 닫힐 때까지 기다린다.
+  - fast=True면 애니메이션·기다림을 건너뛴다 (자동 테스트용).
 """
 from __future__ import annotations
 
+import random
+
 from PyQt5.QtCore import QObject, QTimer
 
-from common.adapter import STAGES
-from dev_stub.fake_model import CHARACTERS, JOBS, SHOP_ITEMS
+from common.constants import STAGES, EXAM_LEVEL_NAMES
+from user_input import Input
+from npc import NPC
+from dev_stub import fake_data as D
+from dev_stub.fake_model import FakeGame, ADULT, MIDDLE, OLD
+
+NPC_EVENT_MS = 1600          # NPC 차례 이벤트 카드는 저절로 닫힌다
 
 
 class FakeController(QObject):
-    def __init__(self, window, user_input, npc, model, parent=None):
-        super().__init__(parent)
+    def __init__(self, window, quick: bool = True, seed: int = None, fast: bool = False):
+        super().__init__(window)
         self.window = window
-        self.input = user_input
-        self.npc = npc
-        self.model = model
-        self.turn = 0
-        self.game_over = False
-
-        # Input이 보내는 시그널 연결 (사용자가 먼저 행동하는 경우)
+        self.quick, self.fast = quick, fast
+        self.rng = random.Random(seed)
+        self.input = Input(window)
+        self.npc = NPC(random.Random(seed))
+        self.game = None
+        self.finished_callback = None            # 테스트용: 게임이 끝나면 부른다
         self.input.roll_requested.connect(self.roll)
-        self.input.invest_requested.connect(self.on_invest_clicked)
+        self.input.invest_requested.connect(self.human_invest)
+        self.input.end_turn_requested.connect(self.next_player)
 
-    # ── 준비 ─────────────────────────────────────────────
-    def start(self) -> bool:
-        configs = self.input.run_setup(CHARACTERS, npc_chooser=self.npc.choose_character)
-        if configs is None:
-            self.window.close()
-            return False
-        self.model.create_players(configs)
-        self.window.set_board(self.model.board)
-        self.window.set_players(self.model.players)
-        self.window.add_log("게임 시작!")
-        self.begin_turn()
-        return True
-
-    # ── 도우미 ───────────────────────────────────────────
-    def current(self):
-        return self.model.players[self.turn]
-
+    # ── 도우미 ──────────────────────────────────────────────────
     def decider(self, p):
-        """같은 질문에 사람은 Input이, 컴퓨터는 NPC가 대답한다"""
+        """사람이면 Input, NPC면 NPC. 함수 이름과 반환값이 같아서 그대로 바꿔 끼운다."""
         return self.npc if p.is_npc else self.input
 
-    def popup_wait(self, p):
-        """NPC 차례 알림창은 자동으로 닫히게"""
-        return self.npc.think_delay_ms * 2 if p.is_npc else None
+    def later(self, ms: int, fn) -> None:
+        QTimer.singleShot(0 if self.fast else ms, fn)
 
-    # ── 턴 진행 ──────────────────────────────────────────
-    def begin_turn(self) -> None:
-        p = self.current()
-        if p.player_age >= 2:
-            p.adult_turns += 1
-        self.window.set_current_player(p)
-        self.window.refresh(self.model.players)
-        can_invest = self.model.can_invest(p)
-
-        if p.is_npc:
-            self.input.lock()                       # NPC 차례에는 사람 클릭 무시
-            if can_invest:
-                self.do_invest(p, self.npc.ask_invest(p, self.model.players))
-            QTimer.singleShot(self.npc.think_delay_ms, self.roll)
-        else:
-            self.input.unlock(can_invest)
-            if can_invest:
-                self.window.add_log(f"{p.player_name}: 투자 기회! (투자하기 버튼)")
-
-    def roll(self) -> None:
-        if self.game_over:
+    def show(self, p, event) -> None:
+        """이벤트 카드 + 기록. NPC 차례 카드는 저절로 닫힌다."""
+        if not event:
             return
-        p = self.current()
-        d1, d2 = self.model.roll_dice()
-        self.window.add_log(f"{p.player_name}: 주사위 {d1} + {d2} = {d1 + d2}")
-        self.window.show_dice(d1, d2, on_done=lambda: self.move(p, d1 + d2))
-
-    def move(self, p, steps: int) -> None:
-        self.window.move_piece(p.player_id, p.player_position, steps,
-                               on_done=lambda: self.after_move(p, steps))
-
-    def after_move(self, p, steps: int) -> None:
-        result = self.model.move(p, steps)
-        self.window.refresh(self.model.players)
-
-        if result["passed_start"]:
-            self.window.add_log(f"{p.player_name}: 출발 칸 통과, 월급 {p.salary:,}원")
-        if p.finished:
-            self.window.add_log(f"{p.player_name}: 노년기를 마쳤습니다!")
-        else:
-            if result["stage_changed"]:
-                self.window.add_log(f"{p.player_name}: {STAGES[p.player_age]} 진입")
-                if STAGES[p.player_age] == "청년기" and not p.player_job:
-                    self.choose_job(p)
-            self.handle_tile(p)
-        self.window.refresh(self.model.players)
-        self.end_turn()
-
-    def choose_job(self, p) -> None:
-        job_id = self.decider(p).ask_job(p, JOBS)
-        self.model.set_job(p, job_id)
-        self.window.add_log(f"{p.player_name}: 직업 → {p.player_job}")
-
-    def handle_tile(self, p) -> None:
-        kind = self.model.tile_kind(p)
-        if kind in ("luck", "badluck"):
-            event = self.model.draw_event(p, kind)
-        elif kind == "item":
-            event = self.model.draw_item()
-        elif kind == "shop":
-            index = self.decider(p).ask_shop(p, SHOP_ITEMS)
-            if index is None:
-                self.window.add_log(f"{p.player_name}: 상점에서 아무것도 사지 않음")
-                return
-            item = SHOP_ITEMS[index]
-            self.model.apply(p, {**item, "money": -item["price"]})
-            self.window.add_log(f"{p.player_name}: {item['name']} 구매")
-            return
-        else:
-            return
-        self.model.apply(p, event)
-        self.window.refresh(self.model.players)
+        self.window.show_event(event, p.player_name, NPC_EVENT_MS if p.is_npc else None)
         self.window.add_log(f"{p.player_name}: {event['name']}")
-        self.window.show_event(event, p.player_name, self.popup_wait(p))
+        self.window.refresh(self.game.players)
 
-    def on_invest_clicked(self) -> None:
-        p = self.current()
-        self.do_invest(p, self.input.ask_invest(p))
-
-    def do_invest(self, p, amount: int) -> None:
-        if amount <= 0:
-            self.window.add_log(f"{p.player_name}: 투자 건너뜀")
+    # ── 게임 시작 ───────────────────────────────────────────────
+    def start(self, rows=None) -> None:
+        rows = rows or self.input.run_setup(D.CHARACTERS, self.npc.choose_character)
+        if rows is None:                       # 설정 창을 닫으면 끝낸다
+            self.window.close()
             return
-        result = self.model.invest(p, amount)
-        self.window.refresh(self.model.players)
-        self.window.add_log(f"{p.player_name}: {result['description']}")
-        self.window.show_event(result, p.player_name, self.popup_wait(p))
+        self.game = FakeGame(rows, random.Random(self.rng.random()), self.quick)
+        self.window.set_board(self.game.board)
+        self.window.set_players(self.game.players)
+        self.window.set_round(1)
+        self.window.show_news(self.game.opening_news)
+        self.window.set_trend(self.game.trend_label())
+        self.later(300, self.start_turn)
 
-    def end_turn(self) -> None:
-        if self.model.all_finished():
-            self.game_over = True
-            self.input.lock()
-            self.window.add_log("게임 종료!")
-            self.window.show_result(self.model.ranking())
+    # ── 1 휴식 확인 ─────────────────────────────────────────────
+    def start_turn(self) -> None:
+        p = self.game.current_player()
+        self.window.set_current_player(p)
+        self.window.refresh(self.game.players)
+        if p.skip_turns > 0:
+            p.skip_turns -= 1
+            self.window.add_log(f"{p.player_name}: 쉬는 턴 (수입 없음)")
+            self.later(700, self.next_player)
             return
-        n = len(self.model.players)
-        for _ in range(n):                     # 노년기를 마친 플레이어는 건너뛴다
-            self.turn = (self.turn + 1) % n
-            if not self.current().finished:
-                break
-        self.begin_turn()
+        self.game.start_turn(p)
+        if p.is_npc:
+            self.input.lock()                  # NPC 차례에는 클릭 무시
+            self.later(self.npc.think_delay_ms(), self.roll)
+        else:
+            self.input.unlock()
+
+    # ── 2 주사위 ────────────────────────────────────────────────
+    def roll(self) -> None:
+        d1, d2 = self.game.roll_dice()
+        self.window.add_log(f"{self.game.current_player().player_name}: 주사위 {d1} + {d2}")
+        if self.fast:
+            self.after_dice(d1, d2)
+        else:
+            self.window.show_dice(d1, d2, on_done=lambda: self.after_dice(d1, d2))
+
+    def after_dice(self, d1: int, d2: int) -> None:
+        p = self.game.current_player()
+        if p.job_state == "student":           # 3 국가고시
+            self.exam(p)
+        result = self.game.move(p, d1 + d2)    # 4 이동 (Model 먼저 바꾸고, 화면은 애니메이션)
+        done = lambda: self.after_move(p, result, d1 + d2)     # noqa: E731
+        if self.fast:
+            done()
+        else:
+            self.window.move_piece(p.player_id, result["from"], d1 + d2, on_done=done)
+
+    # ── 3 국가고시 ──────────────────────────────────────────────
+    def exam(self, p) -> None:
+        q = self.game.exam_question(p)
+        level, limit = p.exam_level, self.game.exam_time_limit(p)
+        level_name = EXAM_LEVEL_NAMES[level]
+        answer = self.decider(p).ask_exam_answer(p, q, limit, level_name)
+        if p.is_npc:                           # NPC는 '고민 중...' 뒤 고른 답을 보여 준다
+            self.window.show_exam_npc(p.player_name, q, level, level_name, limit, answer, self.npc.think_delay_ms())
+        result = self.game.grade_exam(p, q, answer)
+        self.show(p, result)
+        if result["passed"]:
+            return
+        if level < 5 and self.decider(p).ask_retry_exam(p, level):
+            self.game.retry_exam(p)
+            return
+        self.game.give_up_exam(p)
+        self.choose_job(p, exclude=("doctor",), heading=f"{p.player_name}님, 의사 대신 다른 직업을 고르세요")
+
+    # ── 4 이동 뒤: 출발 칸 ──────────────────────────────────────
+    def after_move(self, p, result: dict, dice_sum: int) -> None:
+        self.window.refresh(self.game.players)
+        if result["passed_start"]:
+            self.passed_start(p, result)
+        if p.finished:
+            self.window.add_log(f"{p.player_name}: 인생 완주! 차례에서 빠진다")
+            self.later(500, self.next_player)
+            return
+        self.tile_effect(p)                                   # 5
+        self.income(p, result["steps"], dice_sum)             # 6
+        self.invest_step(p)                                   # 7
+
+    def passed_start(self, p, result: dict) -> None:
+        old, new = result["old_stage"], result["new_stage"]
+        if p.finished:
+            if p.job_id == "freelancer" and p.gig is not None:
+                self.show(p, self.game.settle_gig(p))
+            return
+        if new != old:
+            self.show(p, {"kind": "info", "name": f"{STAGES[new]} 진입!", "description": f"{p.player_lap}바퀴째를 마쳤다."})
+        if new == ADULT and old != ADULT:
+            self.choose_job(p)
+            return
+        if new == MIDDLE and old != MIDDLE and p.job_state == "student":
+            self.show(p, dict(self.game.set_job(p, "freelancer"), name="국가고시 시간 초과... 프리랜서가 됐다"))
+            self.choose_gig(p)
+            return
+        if new == OLD and old != OLD:
+            if p.job_id == "freelancer":
+                self.show(p, self.game.settle_gig(p))         # 마지막 의뢰 정산, 새 의뢰 없음
+            if p.job_id == "artist":
+                art = self.game.make_artwork(p)
+                p.artworks.append(art)
+                self.show(p, self.game.retrospective(p))
+            return
+        if p.job_state != "employed":
+            return
+        card = self.game.card(p, "job_change")                # 직업 변경권
+        if card:
+            job_id = self.decider(p).ask_job(p, self.game.jobs_for(p), exclude=("doctor", p.job_id),
+                                             allow_keep=True, heading="직업 변경권: 다른 직업으로 바꿀까요?")
+            if job_id:
+                self.game.take_card(p, "job_change")
+                self.show(p, self.game.set_job(p, job_id))
+                self.after_job(p)
+                return
+        if p.job_id == "business":
+            self.switch_business(p)
+        elif p.job_id == "freelancer":
+            self.show(p, self.game.settle_gig(p))
+            self.choose_gig(p)
+        elif p.job_id == "artist":
+            self.artwork(p)
+
+    def choose_job(self, p, exclude=(), heading: str = "") -> None:
+        job_id = self.decider(p).ask_job(p, self.game.jobs_for(p), exclude=exclude, heading=heading)
+        self.show(p, self.game.set_job(p, job_id))
+        self.after_job(p)
+
+    def after_job(self, p) -> None:
+        """직업을 고른 순간: 사업가는 업종, 프리랜서는 첫 의뢰"""
+        if p.job_id == "business":
+            bid = self.decider(p).ask_business(p, D.BUSINESSES, self.game.trend, self.game.trend_rounds_left)
+            self.game.set_business(p, bid)
+            self.window.add_log(f"{p.player_name}: 업종 {p.shop_type['name']}")
+        elif p.job_id == "freelancer":
+            self.choose_gig(p)
+
+    def switch_business(self, p) -> None:
+        cost = D.SETTINGS["switch_cost"]
+        bid = self.decider(p).ask_switch_business(p, D.BUSINESSES, self.game.business_id(p), self.game.trend,
+                                                  self.game.trend_rounds_left, cost)
+        if bid:
+            self.game.set_business(p, bid, cost)
+            self.show(p, {"kind": "business", "name": f"업종 변경: {p.shop_type['name']}", "money": -cost})
+
+    def choose_gig(self, p) -> None:
+        gig_id = self.decider(p).ask_gig(p, self.game.gig_cards(), D.SETTINGS["rest_happiness"])
+        self.game.take_gig(p, gig_id)
+        self.window.add_log(f"{p.player_name}: 의뢰 {p.gig['name'] if isinstance(p.gig, dict) else '이번 바퀴는 쉰다'}")
+
+    def artwork(self, p) -> None:
+        art = self.game.make_artwork(p)
+        sell_id = self.decider(p).ask_artwork(p, art, list(p.artworks))
+        self.show(p, self.game.place_artwork(p, art, sell_id))
+
+    # ── 5 칸 효과 ───────────────────────────────────────────────
+    def tile_effect(self, p) -> None:
+        kind = self.game.board[p.player_position]
+        if kind == "luck":
+            double = self.game.take_card(p, "double_luck")
+            self.show(p, self.game.apply_event(p, self.game.draw_event(p, "luck"), 2 if double else 1))
+        elif kind == "badluck":
+            template = self.game.draw_event(p, "badluck")
+            card = self.game.card(p, "bad_to_good")
+            if card and self.decider(p).ask_use_card(p, card, self.game.preview(p, template)):
+                self.game.take_card(p, "bad_to_good")
+                template = self.game.draw_event(p, "luck")
+            self.show(p, self.game.apply_event(p, template))
+        elif kind == "golden_key":
+            self.show(p, self.game.draw_golden_key(p))
+        elif kind == "shop":
+            items = self.game.shop_items(p)
+            index = self.decider(p).ask_shop(p, items, self.game.jobs_for(p))
+            if index is not None:
+                self.show(p, self.game.buy(p, items[index]))
+        elif kind == "rest":
+            p.skip_turns = 1
+            self.show(p, {"kind": "info", "name": "휴식", "description": "다음 턴은 쉰다. 그 턴 수입은 없다."})
+
+    # ── 6 매 턴 수입 ────────────────────────────────────────────
+    def income(self, p, steps: int, dice_sum: int) -> None:
+        result = self.game.apply_income(p, steps, dice_sum)
+        if result["event"]:
+            self.show(p, result["event"])
+        if result["money"] or result["happiness"]:
+            self.window.show_income(p.player_id, result["money"], result["happiness"])
+        self.window.refresh(self.game.players)
+
+    # ── 7 투자 ──────────────────────────────────────────────────
+    def invest_step(self, p) -> None:
+        for event in self.game.settle_investments(p):
+            self.show(p, event)
+        can_invest = self.game.invest_ready(p)
+        if p.is_npc:
+            if can_invest:
+                choice = self.npc.ask_invest(p, self.game.companies, self.game.players)
+                if choice:
+                    self.show(p, self.game.invest(p, choice["company_id"], choice["amount"]))
+            self.later(400, self.next_player)
+        elif can_invest:
+            self.input.unlock_actions(can_invest)       # '턴 마치기'를 누를 때까지 기다린다
+        else:
+            self.later(300, self.next_player)
+
+    def human_invest(self) -> None:
+        p = self.game.current_player()
+        choice = self.input.ask_invest(p, self.game.companies, self.game.players)
+        if choice:
+            self.show(p, self.game.invest(p, choice["company_id"], choice["amount"]))
+        self.input.unlock_actions(False)
+
+    # ── 8 다음 사람 ─────────────────────────────────────────────
+    def next_player(self) -> None:
+        self.input.lock()
+        for headline in self.game.next_turn():
+            self.window.show_news(headline)
+            self.window.set_trend(self.game.trend_label())
+        self.window.set_round(self.game.round)
+        if self.game.is_over():
+            self.game_over()
+            return
+        self.later(250, self.start_turn)
+
+    def game_over(self) -> None:
+        self.game.finish()
+        self.window.refresh(self.game.players)
+        again = self.window.show_result(self.game.ranking())
+        if self.finished_callback:
+            self.finished_callback(self.game)
+            return
+        if again:
+            self.start()
+        else:
+            self.window.close()

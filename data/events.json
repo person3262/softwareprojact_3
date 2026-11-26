@@ -1,0 +1,41 @@
+{
+  "_설명": "행운·불행 이벤트. effects는 크기 단어(+조금/-적당히/+많이), stat은 피해를 줄이는 능력치. job: 직업 id / common(성년기·중년기 공통) / student(의대생) / 없음(유아기·청년기·노년기). TODO(팀원): '이벤트 표' 탭 전체를 옮긴다",
+  "_출처": "게임 규칙 문서 › 이벤트 표 탭",
+  "events": [
+    {
+      "id": "K-L1",
+      "stage": "유아기",
+      "kind": "luck",
+      "name": "생일잔치",
+      "effects": {
+        "happiness": "+많이",
+        "센스": "+조금"
+      },
+      "text": "케이크에 촛불이 하나!"
+    },
+    {
+      "id": "D-A-B1",
+      "stage": "성년기",
+      "job": "doctor",
+      "kind": "badluck",
+      "name": "36시간 연속 당직",
+      "effects": {
+        "happiness": "-적당히"
+      },
+      "stat": "체력",
+      "text": "눈 뜨고 자는 법을 터득했다..."
+    },
+    {
+      "id": "X-L1",
+      "stage": "성년기",
+      "job": "common",
+      "kind": "luck",
+      "name": "결혼",
+      "effects": {
+        "happiness": "+많이"
+      },
+      "special": "marry",
+      "text": "평생 내 편이 생겼다."
+    }
+  ]
+}
