@@ -3,3 +3,6 @@ __pycache__/
 .venv/
 .idea/
 .vscode/
+
+# 화면 모음 PNG (tools/ui_gallery.py --save)
+shots/

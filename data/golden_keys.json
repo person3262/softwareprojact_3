@@ -1,0 +1,20 @@
+{
+  "_설명": "황금열쇠 카드 6종 10장. keep=true면 보관 카드(최대 3장). TODO(팀원): 나머지 카드 추가",
+  "_출처": "게임 규칙 문서 › 이벤트 › 황금열쇠",
+  "golden_keys": [
+    {
+      "id": "double_luck",
+      "name": "행운 보상 2배",
+      "keep": true,
+      "count": 2,
+      "description": "다음 행운 칸 효과 ×2"
+    },
+    {
+      "id": "bad_to_good",
+      "name": "불운→행운 변경권",
+      "keep": true,
+      "count": 2,
+      "description": "불행 칸에서 쓰면 같은 단계 행운으로"
+    }
+  ]
+}

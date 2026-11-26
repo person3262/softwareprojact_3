@@ -5,26 +5,42 @@ view/board_view.py  —  BoardView: 보드판 출력 (FR-02-02) + 말 이동 애
   - Model의 Board는 28칸짜리 1차원 리스트다. (0번 = 출발)
   - 화면은 8×8 격자의 테두리만 쓴다: 위 8 + 아래 8 + 왼쪽 6 + 오른쪽 6 = 28칸
   - build_tile_coords()가 "칸 번호 → 격자 (행, 열)" 표를 만든다.
+  - 가운데 6×6 영역에는 CenterPanel(로고·인생 지도·차례 배너·주사위·속보 띠)을 올린다.
+모양
+  - 칸은 스티커: 자주 나오는 행운·불행은 옅은 바탕 + 큰 아이콘, 특별한 칸(출발·휴식·상점·황금열쇠)은 진한 바탕 + 이름
+  - 말은 한 칸마다 깡충 뛰며 움직인다 (HOP_MS). 지금 차례인 말의 칸은 그 사람 색 테두리로 표시
 """
 from __future__ import annotations
 
-from PyQt5.QtCore import Qt, QRectF, QTimer
-from PyQt5.QtGui import QPainter, QColor, QPen, QBrush, QFont
+from PyQt5.QtCore import Qt, QRectF, QVariantAnimation, QEasingCurve
+from PyQt5.QtGui import QPainter, QColor, QPen, QBrush
 from PyQt5.QtWidgets import QWidget, QSizePolicy
 
-from common.adapter import BOARD_SIZE, TileInfo, read_tile, read_player
+from common.constants import BOARD_SIZE, TILE_KIND_NAMES, TILE_KIND_HINTS
+from common.adapter import TileInfo, read_tile, read_player
 from view import style
+from view.painter_kit import draw_tile_icon, draw_sticker
 from view.piece_view import PieceView
+from view.center_view import CenterPanel
 
 GRID = 8              # 8×8 격자
-MOVE_STEP_MS = 120    # 말이 한 칸 움직이는 데 걸리는 시간(ms) — NFR-02 지연 최소화
+HOP_MS = 170          # 말이 한 칸 깡충 뛰는 데 걸리는 시간(ms) — 7칸이면 약 1.2초
+MOVE_STEP_MS = HOP_MS
+HOP_HEIGHT = 0.32     # 뛰는 높이 (칸 너비 대비)
+SPECIAL_TILES = ("start", "rest", "shop", "golden_key")
+
+# 설계서 8.2 보드 배치 (Model이 오기 전 기본 그림용. 실제 배치는 set_tiles로 받는다)
+DEFAULT_LAYOUT = ["start", "luck", "badluck", "luck", "golden_key", "badluck", "luck", "rest",
+                  "badluck", "luck", "badluck", "shop", "luck", "badluck", "golden_key", "luck",
+                  "badluck", "luck", "badluck", "luck", "badluck", "shop", "luck", "badluck",
+                  "luck", "badluck", "luck", "badluck"]
 
 
 def build_tile_coords(grid: int = GRID, reverse: bool = False) -> list:
     """칸 번호(0~27) → 격자 좌표 (row, col) 목록.
 
     0번(출발) = 오른쪽 아래 모서리.
-    아래 줄을 따라 왼쪽 → 왼쪽 줄을 따라 위 → 위 줄을 따라 오른쪽 → 오른쪽 줄을 따라 아래.
+    아래 줄을 따라 왼쪽 → 왼쪽 줄을 따라 위 → 위 줄을 따라 오른쪽 → 오른쪽 줄을 따라 아래 (시계방향).
     reverse=True 이면 출발 칸은 그대로 두고 도는 방향만 반대로 바꾼다.
     """
     last = grid - 1
@@ -53,20 +69,27 @@ def make_path(start: int, steps: int, size: int = BOARD_SIZE) -> list:
 class BoardView(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(520, 520)
+        self.setMinimumSize(660, 660)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         self.coords = build_tile_coords()
-        self.tiles = [TileInfo("start", "출발")] + [TileInfo("normal") for _ in range(BOARD_SIZE - 1)]
+        self.tiles = [TileInfo(k, TILE_KIND_NAMES[k]) for k in DEFAULT_LAYOUT]
         self.pieces: dict = {}          # player_id → PieceView
-        self.title = "인생마불"
-        self.center_text = ""           # 보드 가운데 작은 안내 문구
+        self.colors: dict = {}          # player_id → QColor
+        self.center = CenterPanel(self)
 
-        # 말 이동 애니메이션 상태
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._step)
+        # 말 이동 애니메이션 상태: 한 칸씩 깡충
+        self._hop = QVariantAnimation(self)
+        self._hop.setDuration(HOP_MS)
+        self._hop.setStartValue(0.0)
+        self._hop.setEndValue(1.0)
+        self._hop.setEasingCurve(QEasingCurve.InOutSine)
+        self._hop.valueChanged.connect(self._on_hop)
+        self._hop.finished.connect(self._next_hop)
         self._moving_piece = None
         self._path: list = []
+        self._hop_from = 0
+        self._hop_t = 0.0
         self._on_done = None
 
     # ── Controller(→ Window)가 부르는 함수 ─────────────────────
@@ -74,18 +97,22 @@ class BoardView(QWidget):
         """Model Board의 타일 리스트(28개)를 받아 칸 그림을 바꾼다."""
         infos = [read_tile(t) for t in tiles][:BOARD_SIZE]
         while len(infos) < BOARD_SIZE:
-            infos.append(TileInfo("normal"))
+            infos.append(TileInfo("luck", "행운"))
         self.tiles = infos
         self.update()
 
     def set_pieces(self, players) -> None:
         """게임 시작 시 플레이어 수만큼 말을 만든다. 순서대로 1~4번, 색도 순서대로."""
         self.pieces.clear()
+        self.colors.clear()
         for order, p in enumerate(players):
             info = read_player(p)
-            piece = PieceView(info.id, order + 1, style.player_color(order), info.is_npc)
+            color = style.player_color(order)
+            piece = PieceView(info.id, order + 1, color, info.is_npc, info.character)
             piece.index = info.position
             self.pieces[info.id] = piece
+            self.colors[info.id] = color
+        self.center.life_map.set_players(players, self.colors)
         self.update()
 
     def update_pieces(self, players) -> None:
@@ -95,23 +122,23 @@ class BoardView(QWidget):
             piece = self.pieces.get(info.id)
             if piece is not None and piece is not self._moving_piece:
                 piece.index = info.position
+        self.center.life_map.set_players(players, self.colors)
         self.update()
 
-    def set_current_player(self, player_id) -> None:
+    def set_current_player(self, player) -> None:
+        info = read_player(player)
         for pid, piece in self.pieces.items():
-            piece.is_current = (pid == player_id)
-        self.update()
-
-    def set_center_text(self, text: str) -> None:
-        self.center_text = text
+            piece.is_current = (pid == info.id)
+        self.center.life_map.set_current(info.id)
+        self.center.banner.set_player(info, self.colors.get(info.id, QColor(style.INK)))
         self.update()
 
     def move_piece(self, player_id, from_index: int, steps: int, on_done=None) -> None:
-        """말을 한 칸씩 움직이는 애니메이션. 다 움직이면 on_done()을 부른다.
+        """말을 한 칸씩 깡충 뛰며 움직인다. 다 움직이면 on_done()을 부른다.
 
         Controller 쪽에서는 이동이 끝난 뒤에 칸 이벤트를 실행하도록 on_done에 넘기면 된다.
         """
-        if self._timer.isActive():          # 이전 이동이 아직 진행 중이면 즉시 끝낸다
+        if self.is_moving():                # 이전 이동이 아직 진행 중이면 즉시 끝낸다
             self._finish_move()
         piece = self.pieces.get(player_id)
         path = make_path(from_index, steps)
@@ -121,36 +148,48 @@ class BoardView(QWidget):
             return
         piece.index = from_index % BOARD_SIZE
         self._moving_piece, self._path, self._on_done = piece, path, on_done
-        self._timer.start(MOVE_STEP_MS)
+        self._start_hop()
 
     def is_moving(self) -> bool:
-        return self._timer.isActive()
+        return self._moving_piece is not None
 
     # ── 애니메이션 내부 ──────────────────────────────────────
-    def _step(self) -> None:
-        if not self._path:
-            self._finish_move()
+    def _start_hop(self) -> None:
+        self._hop_from = self._moving_piece.index
+        self._hop_t = 0.0
+        self._hop.stop()
+        self._hop.start()
+
+    def _on_hop(self, value) -> None:
+        self._hop_t = float(value)
+        self.update()
+
+    def _next_hop(self) -> None:
+        if self._moving_piece is None:
             return
         self._moving_piece.index = self._path.pop(0)
-        self.update()
-        if not self._path:
+        self._hop_t = 0.0
+        if self._path:
+            self._start_hop()
+        else:
             self._finish_move()
 
     def _finish_move(self) -> None:
-        self._timer.stop()
+        self._hop.stop()
         if self._moving_piece is not None and self._path:
             self._moving_piece.index = self._path[-1]
         callback = self._on_done
         self._moving_piece, self._path, self._on_done = None, [], None
+        self._hop_t = 0.0
         self.update()
         if callback:
             callback()
 
     # ── 좌표 계산 ────────────────────────────────────────────
     def _board_rect(self) -> QRectF:
-        """창 크기에 맞춰 가운데에 정사각형 보드 영역을 잡는다."""
-        side = min(self.width(), self.height()) - 16
-        return QRectF((self.width() - side) / 2, (self.height() - side) / 2, side, side)
+        """창 크기에 맞춰 가운데에 정사각형 보드 영역을 잡는다. (판 테두리·그림자 자리를 남긴다)"""
+        side = min(self.width(), self.height()) - 36
+        return QRectF((self.width() - side) / 2, (self.height() - side) / 2 - 4, side, side)
 
     def tile_rect(self, index: int) -> QRectF:
         board = self._board_rect()
@@ -158,60 +197,71 @@ class BoardView(QWidget):
         row, col = self.coords[index % BOARD_SIZE]
         return QRectF(board.left() + col * cell, board.top() + row * cell, cell, cell)
 
+    def resizeEvent(self, event) -> None:
+        board = self._board_rect()
+        cell = board.width() / GRID
+        inner = board.adjusted(cell + 6, cell + 6, -cell - 6, -cell - 6)
+        self.center.setGeometry(inner.toRect())
+        super().resizeEvent(event)
+
     # ── 그리기 ───────────────────────────────────────────────
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-
         board = self._board_rect()
-        cell = board.width() / GRID
-        inner = board.adjusted(cell, cell, -cell, -cell)
+        # 보드 판: 큰 스티커
+        draw_sticker(painter, board.adjusted(-12, -12, 12, 12), "#FFFDF7", radius=30, outline=4, shadow=9)
 
-        # 1) 가운데 바탕 + 제목
-        painter.fillRect(inner, QColor(style.BOARD_BG))
-        title_font = QFont(self.font())
-        title_font.setPixelSize(int(cell * 0.6))
-        title_font.setBold(True)
-        painter.setFont(title_font)
-        painter.setPen(QColor(style.TEXT))
-        painter.drawText(inner.adjusted(0, 0, 0, -cell * 0.8), Qt.AlignCenter, self.title)
-        if self.center_text:
-            sub_font = QFont(self.font())
-            sub_font.setPixelSize(max(10, int(cell * 0.22)))
-            painter.setFont(sub_font)
-            painter.setPen(QColor(style.TEXT_QUIET))
-            painter.drawText(inner.adjusted(0, cell * 0.9, 0, 0), Qt.AlignCenter, self.center_text)
-
-        # 2) 칸 28개
+        current = next((pc for pc in self.pieces.values() if pc.is_current), None)
         for i, tile in enumerate(self.tiles):
-            self._draw_tile(painter, self.tile_rect(i), i, tile)
+            ring = current.color if current is not None and current.index == i and not self.is_moving() else None
+            self._draw_tile(painter, self.tile_rect(i), i, tile, ring)
 
-        # 3) 말 (칸 위에 그려야 가려지지 않는다)
-        for piece in self.pieces.values():
-            piece.draw(painter, self.tile_rect(piece.index))
+        # 말 (칸 위에 그려야 가려지지 않는다, 현재 차례 말은 맨 위)
+        for piece in sorted(self.pieces.values(), key=lambda pc: (pc is self._moving_piece, pc.is_current)):
+            if piece is self._moving_piece and self._path:
+                a = piece.rect_in(self.tile_rect(self._hop_from))
+                b = piece.rect_in(self.tile_rect(self._path[0]))
+                t = self._hop_t
+                rect = QRectF(a.left() + (b.left() - a.left()) * t, a.top() + (b.top() - a.top()) * t,
+                              a.width(), a.height())
+                lift = 4 * t * (1 - t) * self.tile_rect(0).width() * HOP_HEIGHT     # 포물선
+                piece.draw_at(painter, rect, lift)
+            else:
+                piece.draw(painter, self.tile_rect(piece.index))
         painter.end()
 
-    def _draw_tile(self, painter, rect: QRectF, index: int, tile: TileInfo) -> None:
-        painter.setPen(QPen(QColor(style.LINE), 1))
-        painter.setBrush(QBrush(QColor(style.TILE_COLORS.get(tile.kind, "#FFFFFF"))))
-        painter.drawRect(rect)
-
+    def _draw_tile(self, painter, rect: QRectF, index: int, tile: TileInfo, ring=None) -> None:
+        bg, accent, fg = style.TILE_STYLE.get(tile.kind, style.TILE_STYLE["luck"])
         cell = rect.width()
-        # 칸 번호(작게, 왼쪽 위) — 디버깅할 때 편하다
-        small = QFont(self.font())
-        small.setPixelSize(max(8, int(cell * 0.13)))
-        painter.setFont(small)
-        painter.setPen(QColor(style.TEXT_QUIET))
-        painter.drawText(rect.adjusted(3, 1, 0, 0), Qt.AlignLeft | Qt.AlignTop, str(index))
+        box = rect.adjusted(4, 4, -4, -5)
+        special = tile.kind in SPECIAL_TILES
+        draw_sticker(painter, box, bg, radius=max(8.0, cell * 0.13), outline=2.5, shadow=3,
+                     lip=style.darker(bg, 112))
+        if ring is not None:                       # 지금 차례인 사람이 서 있는 칸
+            pen = QPen(QColor(ring), 4)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRoundedRect(box.adjusted(-3, -3, 3, 3), cell * 0.16, cell * 0.16)
 
-        # 칸 이름(이름이 없으면 종류 이름: 행운/불행/상점…)
-        label = tile.name or style.TILE_KIND_NAMES.get(tile.kind, "")
-        if tile.kind == "start":
-            label = f"← {label or '출발'}"   # 말은 아래 줄을 따라 왼쪽으로 출발한다
-        name_font = QFont(self.font())
-        name_font.setPixelSize(max(9, int(cell * 0.17)))
-        name_font.setBold(tile.kind == "start")
-        painter.setFont(name_font)
-        painter.setPen(QColor(style.TEXT))
-        painter.drawText(rect.adjusted(2, cell * 0.14, -2, -cell * 0.55),
-                         Qt.AlignHCenter | Qt.AlignVCenter | Qt.TextWordWrap, label)
+        # 칸 번호 (왼쪽 위, 작게)
+        painter.setPen(QColor(fg if special else style.TEXT_QUIET))
+        painter.setFont(style.title_font(max(9, int(cell * 0.11))))
+        painter.drawText(box.adjusted(6, 3, 0, 0), Qt.AlignLeft | Qt.AlignTop, str(index))
+
+        if not special:                            # 행운·불행: 큰 아이콘만
+            icon = QRectF(box.center().x() - cell * 0.3, box.center().y() - cell * 0.28, cell * 0.6, cell * 0.56)
+            draw_tile_icon(painter, icon, tile.kind, accent)
+            return
+        icon = QRectF(box.center().x() - cell * 0.22, box.top() + box.height() * 0.1, cell * 0.44, cell * 0.4)
+        draw_tile_icon(painter, icon, tile.kind, "#FFFFFF" if tile.kind in ("rest", "shop") else accent)
+        painter.setPen(QColor(fg))
+        painter.setFont(style.title_font(max(11, int(cell * 0.18))))
+        label = tile.name or TILE_KIND_NAMES.get(tile.kind, "")
+        painter.drawText(QRectF(box.left(), box.top() + box.height() * 0.5, box.width(), cell * 0.22),
+                         Qt.AlignCenter, label)
+        hint = TILE_KIND_HINTS.get(tile.kind)
+        if hint:
+            painter.setFont(style.body_font(max(8, int(cell * 0.1)), bold=True))
+            painter.drawText(QRectF(box.left() + 2, box.top() + box.height() * 0.71, box.width() - 4, cell * 0.16),
+                             Qt.AlignCenter, hint)

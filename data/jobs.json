@@ -1,0 +1,39 @@
+{
+  "_설명": "직업 5개. expected_value는 NPC가 직업을 고를 때 쓰는 매 턴 기대 점수. TODO(팀원): 나머지 직업 추가",
+  "_출처": "게임 규칙 문서 › 직업 5개와 직업 선택 규칙",
+  "jobs": [
+    {
+      "id": "doctor",
+      "name": "의사",
+      "category": "돈 우선",
+      "requirements": {
+        "지력": 60
+      },
+      "income": {
+        "money": 100,
+        "happiness": 1
+      },
+      "pension": 50,
+      "device": "exam",
+      "description": "고르면 의대생이 되어 국가고시를 본다",
+      "expected_value": 770
+    },
+    {
+      "id": "business",
+      "name": "사업가",
+      "category": "돈 우선",
+      "requirements": {
+        "체력": 50,
+        "센스": 40
+      },
+      "income": {
+        "money": 0,
+        "happiness": 0
+      },
+      "pension": 50,
+      "device": "business",
+      "description": "업종을 고르고 주사위와 유행으로 실적이 정해진다",
+      "expected_value": 760
+    }
+  ]
+}
